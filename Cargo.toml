@@ -1,0 +1,30 @@
+[package]
+name = "sticknotes"
+version = "0.1.0"
+edition = "2021"
+description = "Stickies-like sticky notes for GNOME, written in Rust/GTK4"
+license = "MIT"
+
+[dependencies]
+# GTK4 + libadwaita: native GNOME application stack.
+# The crates are renamed to the names used by GTK code (`gtk`, `adw`).
+gtk = { package = "gtk4", version = "0.7", features = ["v4_6"] }
+adw = { package = "libadwaita", version = "0.5", features = ["v1_2"] }
+
+# Persistence.
+rusqlite = { version = "0.29", features = ["bundled"] }
+
+# Markdown.
+pulldown-cmark = "0.9"
+
+# Dates / paths / notifications.
+chrono = "0.4"
+dirs = "5"
+notify-rust = "4.10"
+
+# Best-effort EWMH support (always-on-top / sticky) when running on X11.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.14"
+
+[profile.release]
+opt-level = 2
