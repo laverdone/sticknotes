@@ -16,7 +16,7 @@ use chrono::Local;
 use gtk::glib;
 use gtk::{gio, Align, Orientation};
 
-use db::{Database, Note};
+use db::{Database, Note, Priority};
 use note::NoteHandle;
 
 /// In-memory registry of the currently open note windows.
@@ -130,6 +130,9 @@ fn new_blank_note() -> Note {
         daily_reminder: None,
         last_reminder_date: None,
         auto_open: true,
+        due_date: None,
+        priority: Priority::None,
+        deleted_at: None,
     }
 }
 
@@ -243,7 +246,7 @@ fn open_note_window(
     let Some(note) = db
         .lock()
         .ok()
-        .and_then(|conn| conn.get_note(id).ok().flatten())
+        .and_then(|conn| conn.get_active_note(id).ok().flatten())
     else {
         return;
     };
@@ -301,6 +304,12 @@ fn build_manager(
         new_button.connect_clicked(move |_| create_and_open(&app, &db, &notes));
     }
     header.pack_start(&new_button);
+
+    let trash_button = gtk::ToggleButton::new();
+    trash_button.set_icon_name("user-trash-symbolic");
+    trash_button.add_css_class("flat");
+    trash_button.set_tooltip_text(Some("Mostra il cestino"));
+    header.pack_end(&trash_button);
 
     // A plain Button + Popover is used instead of GtkMenuButton: GTK 4.24
     // emits "Duplicate call to gdk_frame_timings_presented()" on the first
@@ -388,7 +397,54 @@ fn build_manager(
 
     window.set_child(Some(&scrolled));
 
-    refresh_list(window.upcast_ref(), app, &db, &notes, &list);
+    let show_trash = Rc::new(Cell::new(false));
+    refresh_list(
+        window.upcast_ref(),
+        app,
+        &db,
+        &notes,
+        &list,
+        show_trash.get(),
+        &trash_button,
+    );
+
+    // Toggle between active notes and the trash.
+    trash_button.connect_toggled({
+        let app = app.clone();
+        let db = db.clone();
+        let notes = notes.clone();
+        let list = list.clone();
+        let show_trash = show_trash.clone();
+        let title = title.clone();
+        let window = window.downgrade();
+        move |button| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            show_trash.set(button.is_active());
+            let text = if button.is_active() {
+                "StickNotes · Cestino"
+            } else {
+                "StickNotes"
+            };
+            button.set_tooltip_text(Some(if button.is_active() {
+                "Torna alle note attive"
+            } else {
+                "Mostra il cestino"
+            }));
+            title.set_text(text);
+            window.set_title(Some(text));
+            refresh_list(
+                window.upcast_ref(),
+                &app,
+                &db,
+                &notes,
+                &list,
+                button.is_active(),
+                button,
+            );
+        }
+    });
 
     // Keep the list in sync whenever the manager is shown again.
     window.connect_map({
@@ -396,6 +452,8 @@ fn build_manager(
         let db = db.clone();
         let notes = notes.clone();
         let list = list.clone();
+        let show_trash = show_trash.clone();
+        let trash_button = trash_button.clone();
         // Weak reference: the closure is owned by the window, so a strong
         // reference here would keep the window alive after it is destroyed.
         let window = window.downgrade();
@@ -403,7 +461,39 @@ fn build_manager(
             let Some(window) = window.upgrade() else {
                 return;
             };
-            refresh_list(window.upcast_ref(), &app, &db, &notes, &list);
+            refresh_list(
+                window.upcast_ref(),
+                &app,
+                &db,
+                &notes,
+                &list,
+                show_trash.get(),
+                &trash_button,
+            );
+        }
+    });
+
+    // Also refresh when the manager regains focus (e.g. after deleting a note
+    // from its own window with the ✕ button).
+    window.connect_notify_local(Some("is-active"), {
+        let app = app.clone();
+        let db = db.clone();
+        let notes = notes.clone();
+        let list = list.clone();
+        let show_trash = show_trash.clone();
+        let trash_button = trash_button.clone();
+        move |window, _| {
+            if window.is_active() {
+                refresh_list(
+                    window.upcast_ref(),
+                    &app,
+                    &db,
+                    &notes,
+                    &list,
+                    show_trash.get(),
+                    &trash_button,
+                );
+            }
         }
     });
 
@@ -429,6 +519,8 @@ fn refresh_list(
     db: &Arc<Mutex<Database>>,
     notes: &NotesMap,
     list: &gtk::ListBox,
+    show_deleted: bool,
+    trash_toggle: &gtk::ToggleButton,
 ) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -437,13 +529,24 @@ fn refresh_list(
     let all = db
         .lock()
         .ok()
-        .and_then(|conn| conn.all_notes().ok())
+        .and_then(|conn| {
+            if show_deleted {
+                conn.deleted_notes().ok()
+            } else {
+                conn.all_notes().ok()
+            }
+        })
         .unwrap_or_default();
 
     if all.is_empty() {
         let row = adw::ActionRow::new();
-        row.set_title("Nessuna nota");
-        row.set_subtitle("Premi + per crearne una");
+        if show_deleted {
+            row.set_title("Cestino vuoto");
+            row.set_subtitle("Le note eliminate restano qui finché non vengono ripristinate");
+        } else {
+            row.set_title("Nessuna nota");
+            row.set_subtitle("Premi + per crearne una");
+        }
         row.set_activatable(false);
         list.append(&row);
         return;
@@ -457,93 +560,139 @@ fn refresh_list(
             note.title.clone()
         };
         row.set_title(&title);
-        row.set_subtitle(&format!("{} · {}", note.created_at, preview_of(&note)));
-        row.set_activatable(true);
 
-        let open_button = gtk::Button::from_icon_name("go-next-symbolic");
-        open_button.add_css_class("flat");
-        open_button.set_valign(Align::Center);
-        open_button.set_tooltip_text(Some("Apri la nota"));
-        {
-            let app = app.clone();
-            let db = db.clone();
-            let notes = notes.clone();
-            let id = note.id;
-            open_button.connect_clicked(move |_| open_note_window(&app, &db, &notes, id, true));
-        }
-        row.add_suffix(&open_button);
+        if show_deleted {
+            let deleted = note
+                .deleted_at
+                .as_deref()
+                .map(format_deleted_date)
+                .unwrap_or_else(|| "—".to_string());
+            row.set_subtitle(&format!("Eliminata il {deleted} · {}", preview_of(&note)));
+            row.set_activatable(false);
 
-        let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
-        delete_button.add_css_class("flat");
-        delete_button.set_valign(Align::Center);
-        delete_button.set_tooltip_text(Some("Elimina la nota"));
-        {
-            let app = app.clone();
-            let db = db.clone();
-            let notes = notes.clone();
-            // Weak references: this callback is owned by a row inside the
-            // list, and keeping the manager window alive here would leave a
-            // destroyed window behind after closing it.
-            let list = list.downgrade();
-            let parent = parent.downgrade();
-            let id = note.id;
-            let title = title.clone();
-            delete_button.connect_clicked(move |_| {
-                let Some(parent) = parent.upgrade() else {
-                    return;
-                };
-                let Some(list) = list.upgrade() else {
-                    return;
-                };
-                let dialog = adw::MessageDialog::new(
-                    Some(&parent),
-                    Some("Eliminare la nota?"),
-                    Some(&format!("«{title}» verrà eliminata definitivamente.")),
-                );
-                dialog.add_response("cancel", "Annulla");
-                dialog.add_response("delete", "Elimina");
-                dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-                dialog.set_default_response(Some("cancel"));
-                dialog.set_close_response("cancel");
+            let restore_button = gtk::Button::from_icon_name("edit-undo-symbolic");
+            restore_button.add_css_class("flat");
+            restore_button.set_valign(Align::Center);
+            restore_button.set_tooltip_text(Some("Ripristina la nota"));
+            {
+                let db = db.clone();
+                let trash_toggle = trash_toggle.clone();
+                let id = note.id;
+                restore_button.connect_clicked(move |_| {
+                    if let Ok(conn) = db.lock() {
+                        let _ = conn.restore_note(id);
+                    }
+                    // Back to the active list, where the restored note appears.
+                    trash_toggle.set_active(false);
+                });
+            }
+            row.add_suffix(&restore_button);
+        } else {
+            row.set_subtitle(&format!("{} · {}", note.created_at, preview_of(&note)));
+            row.set_activatable(true);
 
-                {
-                    let app = app.clone();
-                    let db = db.clone();
-                    let notes = notes.clone();
-                    let list = list.clone();
-                    let parent = parent.clone();
-                    dialog.connect_response(
-                        None,
-                        move |dialog: &adw::MessageDialog, response: &str| {
-                            if response == "delete" {
-                                if let Ok(conn) = db.lock() {
-                                    let _ = conn.delete_note(id);
-                                }
-                                if let Some(handle) = notes.borrow_mut().remove(&id) {
-                                    handle.window.destroy();
-                                }
-                                refresh_list(&parent, &app, &db, &notes, &list);
-                            }
-                            dialog.close();
-                        },
+            let open_button = gtk::Button::from_icon_name("go-next-symbolic");
+            open_button.add_css_class("flat");
+            open_button.set_valign(Align::Center);
+            open_button.set_tooltip_text(Some("Apri la nota"));
+            {
+                let app = app.clone();
+                let db = db.clone();
+                let notes = notes.clone();
+                let id = note.id;
+                open_button.connect_clicked(move |_| open_note_window(&app, &db, &notes, id, true));
+            }
+            row.add_suffix(&open_button);
+
+            let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
+            delete_button.add_css_class("flat");
+            delete_button.set_valign(Align::Center);
+            delete_button.set_tooltip_text(Some("Sposta nel cestino"));
+            {
+                let app = app.clone();
+                let db = db.clone();
+                let notes = notes.clone();
+                // Weak references: this callback is owned by a row inside the
+                // list, and keeping the manager window alive here would leave a
+                // destroyed window behind after closing it.
+                let list = list.downgrade();
+                let parent = parent.downgrade();
+                let trash_toggle = trash_toggle.clone();
+                let id = note.id;
+                let title = title.clone();
+                delete_button.connect_clicked(move |_| {
+                    let Some(parent) = parent.upgrade() else {
+                        return;
+                    };
+                    let Some(list) = list.upgrade() else {
+                        return;
+                    };
+                    let dialog = adw::MessageDialog::new(
+                        Some(&parent),
+                        Some("Spostare la nota nel cestino?"),
+                        Some(&format!("«{title}» potrà essere ripristinata dal cestino.")),
                     );
-                }
+                    dialog.add_response("cancel", "Annulla");
+                    dialog.add_response("delete", "Sposta nel cestino");
+                    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
 
-                dialog.present();
-            });
-        }
-        row.add_suffix(&delete_button);
+                    {
+                        let app = app.clone();
+                        let db = db.clone();
+                        let notes = notes.clone();
+                        let list = list.clone();
+                        let parent = parent.clone();
+                        let trash_toggle = trash_toggle.clone();
+                        dialog.connect_response(
+                            None,
+                            move |dialog: &adw::MessageDialog, response: &str| {
+                                if response == "delete" {
+                                    if let Ok(conn) = db.lock() {
+                                        let _ = conn.delete_note(id);
+                                    }
+                                    if let Some(handle) = notes.borrow_mut().remove(&id) {
+                                        handle.window.destroy();
+                                    }
+                                    refresh_list(
+                                        &parent,
+                                        &app,
+                                        &db,
+                                        &notes,
+                                        &list,
+                                        false,
+                                        &trash_toggle,
+                                    );
+                                }
+                                dialog.close();
+                            },
+                        );
+                    }
 
-        {
-            let app = app.clone();
-            let db = db.clone();
-            let notes = notes.clone();
-            let id = note.id;
-            row.connect_activated(move |_| open_note_window(&app, &db, &notes, id, true));
+                    dialog.present();
+                });
+            }
+            row.add_suffix(&delete_button);
+
+            {
+                let app = app.clone();
+                let db = db.clone();
+                let notes = notes.clone();
+                let id = note.id;
+                row.connect_activated(move |_| open_note_window(&app, &db, &notes, id, true));
+            }
         }
 
         list.append(&row);
     }
+}
+
+/// Format the soft-delete timestamp "YYYY-MM-DD HH:MM:SS" as DD/MM/YYYY.
+fn format_deleted_date(value: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .map(|date| date.format("%d/%m/%Y").to_string())
+        .unwrap_or_else(|_| value.chars().take(10).collect())
 }
 
 fn preview_of(note: &Note) -> String {
@@ -723,5 +872,115 @@ window.sticknote {
 
 .resize-grip {
     background: transparent;
+}
+
+/* Priority flag (titlebar and status bar) */
+.priority-high {
+    color: #e01b24;
+}
+
+.priority-medium {
+    color: #ff7800;
+}
+
+.priority-low {
+    color: #2ec27e;
+}
+
+/* Priority flag rendered as a text glyph (theme-independent) */
+.note-priority-glyph {
+    color: #8e8e8e;
+    font-size: 15px;
+}
+
+.note-priority-glyph.priority-high {
+    color: #e01b24;
+}
+
+.note-priority-glyph.priority-medium {
+    color: #ff7800;
+}
+
+.note-priority-glyph.priority-low {
+    color: #2ec27e;
+}
+
+.note-status-flag {
+    font-size: 14px;
+}
+
+/* Creation date chip in the titlebar */
+.note-date-chip {
+    padding: 1px 8px;
+    min-height: 18px;
+    border-radius: 999px;
+    background-color: rgba(0, 0, 0, 0.06);
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    box-shadow: none;
+}
+
+.note-date-chip label {
+    font-size: 80%;
+    color: #1f1f1f;
+}
+
+/* The creation-date chip takes the priority color when one is set */
+.note-date-chip.chip-priority-high {
+    background-color: rgba(224, 27, 36, 0.15);
+    border-color: rgba(224, 27, 36, 0.55);
+}
+
+.note-date-chip.chip-priority-high label {
+    color: #a51b2d;
+}
+
+.note-date-chip.chip-priority-medium {
+    background-color: rgba(255, 120, 0, 0.16);
+    border-color: rgba(255, 120, 0, 0.55);
+}
+
+.note-date-chip.chip-priority-medium label {
+    color: #a34a00;
+}
+
+.note-date-chip.chip-priority-low {
+    background-color: rgba(46, 194, 126, 0.18);
+    border-color: rgba(46, 194, 126, 0.55);
+}
+
+.note-date-chip.chip-priority-low label {
+    color: #1b6e46;
+}
+
+/* Bottom status bar (edit mode only) */
+.note-statusbar {
+    padding: 4px 8px;
+    border-top: 1px solid rgba(0, 0, 0, 0.10);
+    background-color: rgba(0, 0, 0, 0.03);
+}
+
+.note-status-label {
+    color: #1f1f1f;
+    font-size: 90%;
+}
+
+.note-status-icon {
+    color: #1f1f1f;
+}
+
+.note-status-button {
+    padding: 2px 8px;
+    min-height: 22px;
+}
+
+.note-color-button {
+    min-width: 30px;
+    min-height: 22px;
+    padding: 2px;
+}
+
+.due-overdue .note-status-label,
+.due-overdue .note-status-icon {
+    color: #c01c28;
 }
 "#;

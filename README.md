@@ -5,8 +5,10 @@ Post-it in Markdown per GNOME, scritti in Rust con GTK4 + libadwaita.
 Ogni nota è una finestra **senza bordi di sistema**, ridimensionabile
 trascinando i bordi, con editor Markdown, barra di formattazione e anteprima
 dal vivo. L'header (client-side titlebar) contiene salva/modifica, proprietà
-ed elimina, ma nessun pulsante di sistema. Le note sono salvate in SQLite e
-ripristinate all'avvio.
+ed elimina, ma nessun pulsante di sistema; in modifica è presente anche una
+status bar con scadenza, priorità e colore. Le note sono salvate in SQLite e
+ripristinate all'avvio: le note esistenti si aprono direttamente in **vista
+Markdown**, mentre le note nuove partono in modifica.
 
 ## Requisiti
 
@@ -44,11 +46,17 @@ cargo test
 
 | Requisito | Implementazione |
 |---|---|
-| Persistenza su SQLite | `src/db.rs`, database in `~/.local/share/org.sticknotes.app/sticknotes.db` (WAL). Le immagini sono BLOB nella tabella `assets`. |
+| Persistenza su SQLite | `src/db.rs`, database in `~/.local/share/org.sticknotes.app/sticknotes.db` (WAL). Le immagini sono BLOB nella tabella `assets`. Le migrazioni sono additive (`ALTER TABLE ADD COLUMN`), mai distruttive. |
+| Cestino / cancellazione logica | Il pulsante ✕ della nota e il cestino dell'elenco impostano `deleted_at` (nessun `DELETE`): la riga e le immagini restano in SQLite. Il pulsante **Cestino** nella finestra elenco mostra le note eliminate e permette di ripristinarle con «Ripristina la nota». |
+| Data di creazione nel titolo | Chip cliccabile nel titlebar con la data in `DD/MM/YYYY`, con margini verticali e testo più piccolo del titolo; se la nota ha una priorità il chip ne prende il colore. Il clic apre un popover con data e ora di creazione. |
+| Status bar (solo modifica) | In fondo alla finestra, visibile solo in modalità modifica, con scadenza, priorità e colore della nota. |
+| Scadenza | Pulsante calendario con popover `GtkCalendar` + «Oggi»/«Rimuovi»; la data è salvata in `due_date` (`YYYY-MM-DD`) e mostrata in `DD/MM/YYYY`, in rosso se scaduta. |
+| Priorità | Valori `none`/`low`/`medium`/`high`; bandierina (glifo `⚑`, indipendente dal tema icone) nel titlebar prima del titolo: rossa (alta), arancione (media), verde (bassa), assente (nessuna). Selettore nella status bar. |
+| Colore nota | `GtkColorButton` nella status bar apre il color picker; il colore aggiorna subito scheda e titlebar tramite il provider CSS per-nota e viene salvato nella colonna `color`. |
 | Icona GNOME | All'avvio l'app installa `~/.local/share/applications/org.sticknotes.app.desktop` e l'icona SVG in `~/.local/share/icons/hicolor/scalable/apps/`. L'`application-id` (`org.sticknotes.app`) coincide con il nome del file `.desktop`, quindi GNOME Shell associa le finestre all'icona (dash, app grid, selettore finestre, notifiche). |
 | Finestre senza bordo di sistema, ridimensionabili | `src/note.rs`: header personalizzato usato come **titlebar client-side** (`set_titlebar`), senza pulsanti di sistema: GTK gestisce nativamente ridimensionamento dai bordi e trascinamento. Restano i pulsanti applicativi salva/modifica, proprietà ed elimina. |
 | Titolo semi-trasparente | Il titlebar usa il colore della nota con opacità 75% (`rgba(...)` generato dal colore della nota): resta semi-trasparente sul desktop, mentre titolo e icone restano scuri e leggibili (verificato anche su sfondo scuro). |
-| Salva / modifica | Il pulsante con il disco salva la nota e chiude l'editor in alto, lasciando l'anteprima a tutta finestra; l'icona diventa una matita che riapre l'editor. |
+| Salva / modifica | Il pulsante con il disco salva la nota e chiude l'editor in alto, lasciando l'anteprima a tutta finestra; l'icona diventa una matita che riapre l'editor. All'apertura le note esistenti partono in **vista Markdown**, le note nuove in modifica. |
 | Testo leggibile | I colori sono impostati esplicitamente e solo sui nodi foglia (titolo, icone, editor, anteprima): la nota resta leggibile con tema GNOME chiaro o scuro, e i popover (che erediterebbero il colore da un contenitore) restano leggibili. Editor e anteprima hanno lo stesso sfondo trasparente della scheda. |
 | Editor Markdown + anteprima | Editor `GtkTextView` con anteprima `GtkTextView` renderizzata con `TextTag` (`src/md.rs`). Titolo ricavato automaticamente dal primo heading. |
 | Barra di formattazione | Grassetto (`Ctrl+B`), corsivo (`Ctrl+I`), barrato, codice inline, H1, H2, elenco puntato, elenco numerato, citazione, casella di controllo, link e immagine. I pulsanti applicano/tolgono i marcatori alla selezione o alla riga corrente. |
@@ -61,11 +69,18 @@ cargo test
 
 Note:
 
-* `Alt+F4` / chiusura dal window manager **nasconde** la nota (non la elimina):
-  per cancellarla definitivamente usare il pulsante ✕ o la finestra elenco;
-* la finestra «StickNotes – Elenco note» permette di creare, aprire,
+* `Alt+F4` / chiusura dal window manager **nasconde** la nota (non la elimina);
+* il pulsante ✕ della nota e il cestino dell'elenco **spostano la nota nel
+  cestino** (soft delete): riga e immagini restano in SQLite e possono essere
+  ripristinate dal pulsante **Cestino** della finestra principale;
+* le note ripristinate tornano nell'elenco attivo; non esiste una cancellazione
+  fisica automatica;
+* la finestra elenco **StickNotes** permette di creare, aprire,
   ripristinare ed eliminare le note; scorciatoie `Ctrl+N` (nuova nota),
   `Ctrl+Q` (esci);
+* le note esistenti (ripristinate all'avvio o aperte dall'elenco) si aprono in
+  **vista Markdown**; le note nuove si aprono in modifica e la matita
+  nell'header riapre l'editor;
 * se l'estensione della barra è attiva, l'app resta in esecuzione in background
   anche senza finestre (l'icona nella barra continua a funzionare). Per uscire
   davvero: menu ☰ → «Esci» oppure menu dell'icona → «Esci da StickNotes».
@@ -106,6 +121,6 @@ Wayland nativo.
 src/main.rs    bootstrap dell'applicazione, azioni, finestra elenco, promemoria, CSS
 src/note.rs    finestra nota: header, toolbar markdown, editor, anteprima, immagini, proprietà
 src/md.rs      renderer Markdown → GtkTextBuffer (con immagini)
-src/db.rs      persistenza SQLite (note + asset), migrazioni
+src/db.rs      persistenza SQLite (note + asset), migrazioni additive, soft delete, priorità/scadenza
 src/gnome.rs   integrazione GNOME: .desktop/icona, autostart, estensione Shell, window hints EWMH
 ```
